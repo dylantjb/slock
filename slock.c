@@ -13,21 +13,32 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 #include <sys/types.h>
 #include <X11/extensions/Xrandr.h>
 #include <X11/keysym.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <security/pam_appl.h>
+#include <security/pam_misc.h>
+#include <X11/XF86keysym.h>
+#include <Imlib2.h>
 
 #include "arg.h"
 #include "util.h"
 
 char *argv0;
 
+static time_t locktime;
+static int pam_conv(int num_msg, const struct pam_message **msg, struct pam_response **resp, void *appdata_ptr);
+struct pam_conv pamc = {pam_conv, NULL};
+char passwd[256];
+
 enum {
 	INIT,
 	INPUT,
 	FAILED,
+    PAM,
 	NUMCOLS
 };
 
@@ -35,6 +46,7 @@ struct lock {
 	int screen;
 	Window root, win;
 	Pixmap pmap;
+	Pixmap bgmap;
 	unsigned long colors[NUMCOLS];
 };
 
@@ -46,6 +58,8 @@ struct xrandr {
 
 #include "config.h"
 
+Imlib_Image image;
+
 static void
 die(const char *errstr, ...)
 {
@@ -55,6 +69,31 @@ die(const char *errstr, ...)
 	vfprintf(stderr, errstr, ap);
 	va_end(ap);
 	exit(1);
+}
+
+static int
+pam_conv(int num_msg, const struct pam_message **msg,
+		struct pam_response **resp, void *appdata_ptr)
+{
+	int retval = PAM_CONV_ERR;
+	for(int i=0; i<num_msg; i++) {
+		if (msg[i]->msg_style == PAM_PROMPT_ECHO_OFF &&
+				strncmp(msg[i]->msg, "Password: ", 10) == 0) {
+			struct pam_response *resp_msg = malloc(sizeof(struct pam_response));
+			if (!resp_msg)
+				die("malloc failed\n");
+			char *password = malloc(strlen(passwd) + 1);
+			if (!password)
+				die("malloc failed\n");
+			memset(password, 0, strlen(passwd) + 1);
+			strcpy(password, passwd);
+			resp_msg->resp_retcode = 0;
+			resp_msg->resp = password;
+			resp[i] = resp_msg;
+			retval = PAM_SUCCESS;
+		}
+	}
+	return retval;
 }
 
 #ifdef __linux__
@@ -121,6 +160,8 @@ gethash(void)
 	}
 #endif /* HAVE_SHADOW_H */
 
+	/* pam, store user name */
+	hash = pw->pw_name;
 	return hash;
 }
 
@@ -129,11 +170,12 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
        const char *hash)
 {
 	XRRScreenChangeNotifyEvent *rre;
-	char buf[32], passwd[256], *inputhash;
-	int num, screen, running, failure, oldc;
+	char buf[32];
+	int num, screen, running, failure, oldc, retval;
 	unsigned int len, color;
 	KeySym ksym;
 	XEvent ev;
+    pam_handle_t *pamh;
 
 	len = 0;
 	running = 1;
@@ -141,6 +183,7 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 	oldc = INIT;
 
 	while (running && !XNextEvent(dpy, &ev)) {
+		running = !((time(NULL) - locktime < timetocancel) && (ev.type == MotionNotify));
 		if (ev.type == KeyPress) {
 			explicit_bzero(&buf, sizeof(buf));
 			num = XLookupString(&ev.xkey, buf, sizeof(buf), &ksym, 0);
@@ -156,14 +199,58 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 			    IsPFKey(ksym) ||
 			    IsPrivateKeypadKey(ksym))
 				continue;
+           	if (ev.xkey.state & ControlMask) {
+				switch (ksym) {
+				case XK_u:
+					ksym = XK_Escape;
+					break;
+				case XK_m:
+					ksym = XK_Return;
+					break;
+				case XK_j:
+					ksym = XK_Return;
+					break;
+				case XK_h:
+					ksym = XK_BackSpace;
+					break;
+				}
+			}
 			switch (ksym) {
+            case XF86XK_AudioPlay:
+            case XF86XK_AudioStop:
+            case XF86XK_AudioPrev:
+            case XF86XK_AudioNext:
+            case XF86XK_AudioRaiseVolume:
+            case XF86XK_AudioLowerVolume:
+            case XF86XK_AudioMute:
+            case XF86XK_AudioMicMute:
+            case XF86XK_MonBrightnessDown:
+            case XF86XK_MonBrightnessUp:
+                XSendEvent(dpy, DefaultRootWindow(dpy), True, KeyPressMask, &ev);
+                break;
 			case XK_Return:
 				passwd[len] = '\0';
 				errno = 0;
-				if (!(inputhash = crypt(passwd, hash)))
-					fprintf(stderr, "slock: crypt: %s\n", strerror(errno));
+				retval = pam_start(pam_service, hash, &pamc, &pamh);
+				color = PAM;
+				for (screen = 0; screen < nscreens; screen++) {
+					XSetWindowBackground(dpy, locks[screen]->win, locks[screen]->colors[color]);
+					XClearWindow(dpy, locks[screen]->win);
+					XRaiseWindow(dpy, locks[screen]->win);
+				}
+				XSync(dpy, False);
+
+				if (retval == PAM_SUCCESS)
+					retval = pam_authenticate(pamh, 0);
+				if (retval == PAM_SUCCESS)
+					retval = pam_acct_mgmt(pamh, 0);
+
+				running = 1;
+				if (retval == PAM_SUCCESS)
+					running = 0;
 				else
-					running = !!strcmp(inputhash, hash);
+					fprintf(stderr, "slock: %s\n", pam_strerror(pamh, retval));
+				pam_end(pamh, retval);
 				if (running) {
 					XBell(dpy, 100);
 					failure = 1;
@@ -190,9 +277,10 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 			color = len ? INPUT : ((failure || failonclear) ? FAILED : INIT);
 			if (running && oldc != color) {
 				for (screen = 0; screen < nscreens; screen++) {
-					XSetWindowBackground(dpy,
-					                     locks[screen]->win,
-					                     locks[screen]->colors[color]);
+                    if(locks[screen]->bgmap)
+                        XSetWindowBackgroundPixmap(dpy, locks[screen]->win, locks[screen]->bgmap);
+                    else
+                        XSetWindowBackground(dpy, locks[screen]->win, locks[screen]->colors[0]);
 					XClearWindow(dpy, locks[screen]->win);
 				}
 				oldc = color;
@@ -235,6 +323,17 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
 	lock->screen = screen;
 	lock->root = RootWindow(dpy, lock->screen);
 
+    if(image) 
+    {
+        lock->bgmap = XCreatePixmap(dpy, lock->root, DisplayWidth(dpy, lock->screen), DisplayHeight(dpy, lock->screen), DefaultDepth(dpy, lock->screen));
+        imlib_context_set_image(image);
+        imlib_context_set_display(dpy);
+        imlib_context_set_visual(DefaultVisual(dpy, lock->screen));
+        imlib_context_set_colormap(DefaultColormap(dpy, lock->screen));
+        imlib_context_set_drawable(lock->bgmap);
+        imlib_render_image_on_drawable(0, 0);
+        imlib_free_image();
+    }
 	for (i = 0; i < NUMCOLS; i++) {
 		XAllocNamedColor(dpy, DefaultColormap(dpy, lock->screen),
 		                 colorname[i], &color, &dummy);
@@ -251,7 +350,10 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
 	                          CopyFromParent,
 	                          DefaultVisual(dpy, lock->screen),
 	                          CWOverrideRedirect | CWBackPixel, &wa);
-	lock->pmap = XCreateBitmapFromData(dpy, lock->win, curs, 8, 8);
+    if(lock->bgmap) {
+        XSetWindowBackgroundPixmap(dpy, lock->win, lock->bgmap);
+    }
+    lock->pmap = XCreateBitmapFromData(dpy, lock->win, curs, 8, 8);
 	invisible = XCreatePixmapCursor(dpy, lock->pmap, lock->pmap,
 	                                &color, &color, 0, 0);
 	XDefineCursor(dpy, lock->win, invisible);
@@ -276,6 +378,7 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
 				XRRSelectInput(dpy, lock->win, RRScreenChangeNotifyMask);
 
 			XSelectInput(dpy, lock->root, SubstructureNotifyMask);
+            locktime = time(NULL);
 			return lock;
 		}
 
@@ -339,10 +442,9 @@ main(int argc, char **argv) {
 	dontkillme();
 #endif
 
+	/* the contents of hash are used to transport the current user name */
 	hash = gethash();
 	errno = 0;
-	if (!crypt("", hash))
-		die("slock: crypt: %s\n", strerror(errno));
 
 	if (!(dpy = XOpenDisplay(NULL)))
 		die("slock: cannot open display\n");
@@ -355,6 +457,60 @@ main(int argc, char **argv) {
 	if (setuid(duid) < 0)
 		die("slock: setuid: %s\n", strerror(errno));
 
+	/*Create screenshot Image*/
+	Screen *scr = ScreenOfDisplay(dpy, DefaultScreen(dpy));
+	image = imlib_create_image(scr->width,scr->height);
+	imlib_context_set_image(image);
+	imlib_context_set_display(dpy);
+	imlib_context_set_visual(DefaultVisual(dpy,0));
+	imlib_context_set_drawable(RootWindow(dpy,XScreenNumberOfScreen(scr)));	
+	imlib_copy_drawable_to_image(0,0,0,scr->width,scr->height,0,0,1);
+
+#ifdef BLUR
+
+	/*Blur function*/
+	imlib_image_blur(blurRadius);
+#endif // BLUR	
+
+#ifdef PIXELATION
+	/*Pixelation*/
+	int width = scr->width;
+	int height = scr->height;
+	
+	for(int y = 0; y < height; y += pixelSize)
+	{
+		for(int x = 0; x < width; x += pixelSize)
+		{
+			int red = 0;
+			int green = 0;
+			int blue = 0;
+
+			Imlib_Color pixel; 
+			Imlib_Color* pp;
+			pp = &pixel;
+			for(int j = 0; j < pixelSize && j < height; j++)
+			{
+				for(int i = 0; i < pixelSize && i < width; i++)
+				{
+					imlib_image_query_pixel(x+i,y+j,pp);
+					red += pixel.red;
+					green += pixel.green;
+					blue += pixel.blue;
+				}
+			}
+			red /= (pixelSize*pixelSize);
+			green /= (pixelSize*pixelSize);
+			blue /= (pixelSize*pixelSize);
+			imlib_context_set_color(red,green,blue,pixel.alpha);
+			imlib_image_fill_rectangle(x,y,pixelSize,pixelSize);
+			red = 0;
+			green = 0;
+			blue = 0;
+		}
+	}
+	
+	
+#endif
 	/* check for Xrandr support */
 	rr.active = XRRQueryExtension(dpy, &rr.evbase, &rr.errbase);
 
