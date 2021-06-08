@@ -244,6 +244,8 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 					retval = pam_authenticate(pamh, 0);
 				if (retval == PAM_SUCCESS)
 					retval = pam_acct_mgmt(pamh, 0);
+                if (retval == PAM_SUCCESS)
+                    retval = pam_setcred(pamh, PAM_REFRESH_CRED);
 
 				running = 1;
 				if (retval == PAM_SUCCESS)
