@@ -21,6 +21,7 @@ pkgver() {
 prepare() {
     cd $_pkgname
     sed "/user  =/s/nobody/$USER/" -i config.h
+    sed "/group =/s/nobody/$(id -gn)/" -i config.h
 }
 
 build() {
