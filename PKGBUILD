@@ -8,6 +8,7 @@ arch=('x86_64' 'i686')
 url="https://github.com/dylantjb/$_pkgname"
 license=('MIT/X Consortium License')
 makedepends=('git' 'make')
+depends=('xorg-xrandr' 'imlib2')
 provides=($_pkgname)
 conflicts=($_pkgname)
 source=("git+$url")
